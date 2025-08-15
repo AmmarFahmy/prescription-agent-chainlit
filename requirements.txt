@@ -1,0 +1,6 @@
+chainlit==2.5.5
+tokeniser
+litellm==1.73.0
+linkup-sdk==0.2.7
+azure-storage-blob==12.25.1
+asyncpg
