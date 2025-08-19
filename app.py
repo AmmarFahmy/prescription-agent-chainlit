@@ -27,11 +27,11 @@ MODEL_OPTIONS = {
         "model_id": "gemini-2.0-flash",
         "reasoning": False
     },
-    "Gemini 2.0 Flash (Experimental)": {
-        "provider": "google",
-        "model_id": "gemini-2.0-flash-exp",
-        "reasoning": False
-    }
+    # "Gemini 2.0 Flash (Experimental)": {
+    #     "provider": "google",
+    #     "model_id": "gemini-2.0-flash-exp",
+    #     "reasoning": False
+    # }
 }
 
 
@@ -257,7 +257,7 @@ async def on_message(message: cl.Message):
     thinking_msg = None
     if agent.reasoning:
         current_model = cl.user_session.get("current_model", "Unknown Model")
-        thinking_msg = cl.Message(content=f"🤔 {current_model} is thinking...")
+        thinking_msg = cl.Message(content=f"{current_model} is thinking...")
         await thinking_msg.send()
 
     try:

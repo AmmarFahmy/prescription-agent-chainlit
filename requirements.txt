@@ -3,5 +3,6 @@ tokeniser
 linkup-sdk==0.2.7
 azure-storage-blob==12.25.1
 asyncpg
+openai
 google-genai
 agno

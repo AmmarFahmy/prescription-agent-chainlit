@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  chainlit-app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # OpenAI Configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      
+      # Google AI Configuration
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      
+      # Linkup Configuration
+      - LINKUP_API_KEY=${LINKUP_API_KEY}
+      
+      # Database Configuration (if using external database)
+      - DATABASE_URL=${DATABASE_URL:-file:./dev.db}
+      
+      # Chainlit Configuration
+      - CHAINLIT_PORT=8000
+      - CHAINLIT_HOST=0.0.0.0
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET}
+      
+      # Optional: OAuth Configuration
+      - OAUTH_GOOGLE_CLIENT_ID=${OAUTH_GOOGLE_CLIENT_ID}
+      - OAUTH_GOOGLE_CLIENT_SECRET=${OAUTH_GOOGLE_CLIENT_SECRET}
+      
+    volumes:
+      # Persist Chainlit data
+      - chainlit_data:/app/.chainlit/data
+      
+      # Persist database (if using SQLite)
+      - ./prisma:/app/prisma
+      
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  chainlit_data: 
