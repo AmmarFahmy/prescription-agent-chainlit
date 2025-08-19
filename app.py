@@ -1,18 +1,38 @@
-from typing import Any, Dict, List, Optional
-import json
+from typing import List, Dict, Optional
 import os
-import base64
 import chainlit as cl
-import tokeniser
-import litellm
+from agno.agent import Agent
+from agno.models.openai import OpenAIChat
+from agno.models.google import Gemini
+from agno.media import Image
 from linkup import LinkupClient
-from prompt import PROPOSAL_GENERATION_PROMPT
+from chainlit.input_widget import Select
+from prompt import PRESCRIPTION_AGENT_PROMPT
 
 
-MAX_CONTEXT_WINDOW_TOKENS = 70000
-DEFAULT_MODEL = "openai/gpt-5-mini"
+DEFAULT_OPENAI_MODEL = "o4-mini"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 
 linkup_client = LinkupClient(api_key=os.environ["LINKUP_API_KEY"])
+
+# Model options for the chat settings
+MODEL_OPTIONS = {
+    "OpenAI o4-mini (Reasoning)": {
+        "provider": "openai",
+        "model_id": "o4-mini",
+        "reasoning": True
+    },
+    "Gemini 2.0 Flash": {
+        "provider": "google",
+        "model_id": "gemini-2.0-flash",
+        "reasoning": False
+    },
+    "Gemini 2.0 Flash (Experimental)": {
+        "provider": "google",
+        "model_id": "gemini-2.0-flash-exp",
+        "reasoning": False
+    }
+}
 
 
 # @cl.password_auth_callback
@@ -27,68 +47,18 @@ linkup_client = LinkupClient(api_key=os.environ["LINKUP_API_KEY"])
 #         return None
 
 
-def _encode_image_to_data_url(file_path: str, mime_type: str) -> Optional[str]:
+def _extract_agno_images_from_message(msg: cl.Message) -> List[Image]:
     """
-    Read an image file and return a data URL string suitable for OpenAI vision input.
+    Extract Agno Image objects from message elements.
     """
-    try:
-        with open(file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        prefix = mime_type if mime_type else "image/png"
-        return f"data:{prefix};base64,{b64}"
-    except Exception:
-        return None
-
-
-def _extract_image_parts_from_message(msg: cl.Message) -> List[Dict[str, Any]]:
-    """
-    Build content parts for any image elements attached to the message.
-    Returns a list of OpenAI-compatible content parts with type "image_url".
-    """
-    image_parts: List[Dict[str, Any]] = []
-    try:
-        for element in getattr(msg, "elements", []) or []:
-            mime = getattr(element, "mime", None)
-            if not (mime and isinstance(mime, str) and mime.startswith("image/")):
-                continue
-
-            # Prefer local path if available and readable
+    images = []
+    for element in getattr(msg, "elements", []) or []:
+        mime = getattr(element, "mime", None)
+        if mime and isinstance(mime, str) and mime.startswith("image/"):
             path = getattr(element, "path", None)
-            data_url: Optional[str] = None
             if path and isinstance(path, str) and os.path.exists(path):
-                data_url = _encode_image_to_data_url(path, mime)
-            else:
-                # Fallback to remote URL if Chainlit provided one
-                url = getattr(element, "url", None)
-                if url and isinstance(url, str):
-                    data_url = url
-
-            if data_url:
-                image_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": data_url}
-                })
-    except Exception:
-        # Fail open: if anything goes wrong, just skip images
-        return []
-
-    return image_parts
-
-
-def _build_user_message_content(msg: cl.Message) -> Any:
-    """
-    Build the content field for a user message, combining text and any attached images.
-    Returns either a string (text only) or a list of content parts for multimodal.
-    """
-    text = msg.content or ""
-    image_parts = _extract_image_parts_from_message(msg)
-    if image_parts:
-        parts: List[Dict[str, Any]] = []
-        if text:
-            parts.append({"type": "text", "text": text})
-        parts.extend(image_parts)
-        return parts
-    return text
+                images.append(Image(filepath=path))
+    return images
 
 
 @cl.oauth_callback
@@ -104,28 +74,6 @@ def oauth_callback(
 async def on_chat_resume(thread):
     pass
 
-# Tool definitions
-SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-            "name": "search_web",
-        "description": "Performs a search for user input query using Linkup sdk then returns a string of the top search results. Should be used to search real-time data.",
-        "parameters": {
-                    "type": "object",
-                    "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search query string"
-                            },
-                        "depth": {
-                                "type": "string",
-                                "description": "The depth of the search: 'standard' or 'deep'. Standard is faster, deep is more thorough."
-                            }
-                    },
-            "required": ["query", "depth"]
-        }
-    }
-}
 
 # Available commands in the UI
 COMMANDS = [
@@ -137,60 +85,6 @@ COMMANDS = [
                 "persistent": True
     },
 ]
-
-
-def truncate_messages(messages: List[Dict[str, Any]], max_tokens: int = MAX_CONTEXT_WINDOW_TOKENS) -> List[Dict[str, Any]]:
-    """
-    Truncate conversation messages to fit within token limit.
-    Simply keeps the most recent messages that fit within the token budget.
-    Ensures the last message is not from the assistant.
-
-    Args:
-            messages: List of conversation messages
-            max_tokens: Maximum allowed tokens
-
-    Returns:
-            Truncated list of messages that fit within the token budget
-    """
-    if not messages:
-        return []
-
-    truncated = messages.copy()
-
-    # Remove last message if it's from assistant
-    if truncated and truncated[-1]["role"] == "assistant":
-        truncated = truncated[:-1]
-
-    total_tokens = 0
-
-    def _count_tokens(content: Any) -> int:
-        # Handle both string and multimodal content lists
-        if isinstance(content, str):
-            return tokeniser.estimate_tokens(content)
-        if isinstance(content, list):
-            text_content = " ".join(
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-            return tokeniser.estimate_tokens(text_content)
-        # Fallback
-        return 0
-
-    # Work backwards from the end to keep most recent messages
-    for i in range(len(truncated) - 1, -1, -1):
-        message_tokens = _count_tokens(truncated[i]["content"])
-        total_tokens += message_tokens
-
-        if total_tokens > max_tokens:
-            truncated = truncated[i + 1:]
-            break
-
-    # Double check: remove last message if it's from assistant after truncation
-    if truncated and truncated[-1]["role"] == "assistant":
-        truncated = truncated[:-1]
-
-    return truncated
 
 
 async def search_web(query: str, depth: str = "deep") -> str:
@@ -223,190 +117,214 @@ async def search_web(query: str, depth: str = "deep") -> str:
         return f"Search failed: {str(e)}"
 
 
-async def process_tool_calls(tool_calls: Dict, context_messages: List[Dict[str, Any]], msg: cl.Message):
-    """
-    Process tool calls made by the model
-
-    Args:
-            tool_calls: Dictionary of tool calls from the model
-            context_messages: Conversation context
-            msg: Chainlit message object for streaming response
-
-    Returns:
-            The generated response after processing tool calls
-    """
-    # Show temporary "searching" message
-    tmp_message = cl.Message(content="Searching the web...", author="Tool")
-    await tmp_message.send()
-    await cl.sleep(0.5)
-
-    for _, tool_info in tool_calls.items():
-        try:
-            arguments = json.loads(tool_info["arguments"])
-
-            if tool_info["name"] == "search_web":
-                # Execute web search
-                search_depth = arguments.get("depth", "deep")
-                search_result = await search_web(
-                    arguments["query"],
-                    search_depth
-                )
-
-                # Add search results to conversation context
-                context_messages.append({
-                    "role": "user",
-                    "content": search_result
-                })
-
-        except json.JSONDecodeError:
-            await msg.stream_token("Error: Failed to parse tool arguments")
-            return "Error: Failed to parse tool arguments"
-        except Exception as e:
-            await msg.stream_token(f"Error: Tool execution failed - {str(e)}")
-            return f"Error: Tool execution failed - {str(e)}"
-
-    # Remove temporary message
-    await tmp_message.remove()
-
-    # Generate final response with search results
-    # system_prompt = "Based on the information, give a comprehensive answer. At the end of your answer, list the used sources with their name and url."
-    system_prompt = PROPOSAL_GENERATION_PROMPT
-
-    await msg.stream_token("\n\n")
-
-    tool_response = ""
-    stream = await litellm.acompletion(
-        model=DEFAULT_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt}, *context_messages],
-        stream=True
-    )
-
-    async for chunk in stream:
-        if chunk.choices[0].delta.content:
-            tool_response += chunk.choices[0].delta.content
-            await msg.stream_token(chunk.choices[0].delta.content)
-
-    return tool_response
-
-
-async def run_with_tools(messages: List[Dict[str, Any]], selected_tool: str = None) -> str:
-    """
-    Run a conversation through OpenAI with function calling enabled.
-
-    Args:
-            messages: List of conversation messages
-            selected_tool: Optional tool to force using
-
-    Returns:
-            Generated response content
-    """
-    # Create message for streaming
-    msg = cl.Message(content="", author="Agent")
-
-    # Truncate messages to fit context window
-    context_messages = truncate_messages(messages)
-
-    # Configure tool choice
-    tool_choice = "auto"
-    if selected_tool:
-        tool_choice = {"type": "function", "function": {"name": selected_tool}}
-
-    # Initial response generation
-    current_tool_calls = {}
-    response_content = ""
-
-    system_prompt = PROPOSAL_GENERATION_PROMPT
-
-    # Stream the response
+# Define the search tool for the agent
+def search_web_tool(query: str, depth: str = "deep") -> str:
+    """Search the web for real-time information."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        stream = await litellm.acompletion(
-            model=DEFAULT_MODEL,
-            messages=[{"role": "system", "content": system_prompt},
-                      *context_messages],
-            tools=[SEARCH_TOOL],
-            tool_choice=tool_choice,
-            stream=True
+        return loop.run_until_complete(search_web(query, depth))
+    finally:
+        loop.close()
+
+
+def create_agent(model_name: str = "OpenAI o4-mini (Reasoning)"):
+    """Create an agent based on the selected model."""
+    model_config = MODEL_OPTIONS.get(
+        model_name, MODEL_OPTIONS["OpenAI o4-mini (Reasoning)"])
+
+    if model_config["provider"] == "openai":
+        model = OpenAIChat(
+            id=model_config["model_id"],
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+    else:  # google
+        model = Gemini(
+            id=model_config["model_id"],
+            api_key=os.getenv("GOOGLE_API_KEY")
         )
 
-        async for chunk in stream:
-            # Process text content
-            if chunk.choices[0].delta.content:
-                response_content += chunk.choices[0].delta.content
-                await msg.stream_token(chunk.choices[0].delta.content)
+    # Add model signature to instructions
+    model_signature = f"\n\nIMPORTANT: At the end of EVERY response, you MUST add a new line and then print exactly: 'Response generated by {model_config['model_id']}'"
 
-            # Process tool calls
-            if chunk.choices[0].delta.tool_calls:
-                for tool_call in chunk.choices[0].delta.tool_calls:
-                    tool_id = tool_call.index
+    agent = Agent(
+        model=model,
+        description="You are an AI Senior Consultant Pharmacist with extensive clinical experience, serving as a mentor and guide to a team of pharmacists ranging from interns to senior practitioners. Your role is to analyze medical prescriptions, clinic bills, OPD invoices, and medical receipts with the highest level of accuracy and clinical insight.",
+        # instructions=PRESCRIPTION_AGENT_PROMPT + model_signature,
+        instructions=PRESCRIPTION_AGENT_PROMPT,
+        tools=[search_web_tool],
+        add_history_to_messages=True,
+        markdown=True,
+        reasoning=model_config.get("reasoning", False),
+        reasoning_max_steps=10 if model_config.get(
+            "reasoning", False) else None,
+    )
 
-                    # Initialize new tool call
-                    if tool_id not in current_tool_calls and tool_call.function.name:
-                        current_tool_calls[tool_id] = {
-                            "name": tool_call.function.name,
-                            "arguments": tool_call.function.arguments or ""
-                        }
-                    # Append to existing tool call
-                    elif tool_id in current_tool_calls:
-                        current_tool_calls[tool_id]["arguments"] += tool_call.function.arguments or ""
-
-            # Add assistant's response to context
-            context_messages.append(
-                {"role": "assistant", "content": response_content})
-
-        # Send initial message
-        await msg.send()
-
-        # Process any tool calls and combine responses
-        if current_tool_calls:
-            if len(response_content) == 0:
-                # Display initial message if no response content.
-                # Can be the case when the user explicitly asks for a tool.
-                # response_content = "To answer this question thoroughly, I'll need to use my tools !"
-                response_content = ""
-                await msg.stream_token(response_content)
-                await msg.update()
-
-            tool_response = await process_tool_calls(current_tool_calls, context_messages, msg)
-
-            if tool_response:
-                response_content = f"{response_content}\n\n{tool_response}"
-
-        # Update the message with final content
-        await msg.update()
-
-        return response_content
-
-    except Exception as e:
-        error_msg = f"Error generating response: {str(e)}"
-        await cl.Message(content=error_msg).send()
-        return error_msg
+    return agent
 
 
 @cl.on_chat_start
-async def start_chat():
-    """Initialize the chat session"""
+async def on_chat_start():
+    """Initialize the chat session and create the agent."""
 
+    # Send chat settings
+    settings = await cl.ChatSettings(
+        [
+            Select(
+                id="Model",
+                label="Model",
+                values=list(MODEL_OPTIONS.keys()),
+                initial_index=0,
+            ),
+        ]
+    ).send()
+
+    # Create default agent
+    agent = create_agent()
+
+    # Store agent in session
+    cl.user_session.set("agent", agent)
+    cl.user_session.set("chat_messages", [])
+    cl.user_session.set("current_model", "OpenAI o4-mini (Reasoning)")
+
+    # Set available commands
     await cl.context.emitter.set_commands(COMMANDS)
 
-    cl.user_session.set("chat_messages", [])
+
+@cl.on_settings_update
+async def setup_agent(settings):
+    """Handle settings update to switch between models."""
+    selected_model = settings["Model"]
+    current_model = cl.user_session.get("current_model")
+
+    # Only recreate agent if model changed
+    if selected_model != current_model:
+        # Show model switching message
+        await cl.Message(content=f"Switching to {selected_model}...").send()
+
+        # Create new agent with selected model
+        agent = create_agent(selected_model)
+
+        # Update session
+        cl.user_session.set("agent", agent)
+        cl.user_session.set("current_model", selected_model)
+
+        # Confirm model switch
+        await cl.Message(content=f"✅ Now using **{selected_model}**").send()
 
 
 @cl.on_message
-async def on_message(msg: cl.Message):
-    """Handle incoming user messages"""
+async def on_message(message: cl.Message):
+    """Handle incoming messages and images from the user."""
 
-    chat_messages = cl.user_session.get("chat_messages", [])
+    # Get the agent from session
+    agent = cl.user_session.get("agent")
 
-    # Build user content (text + images if any)
-    user_content = _build_user_message_content(msg)
-    chat_messages.append({"role": "user", "content": user_content})
+    # Extract images from uploaded files
+    images = _extract_agno_images_from_message(message)
 
-    # Process message with or without explicit search command
-    if msg.command == "Search":
-        response = await run_with_tools(chat_messages, "search_web")
-    else:
-        response = await run_with_tools(chat_messages)
+    # Show uploaded images in chat
+    for i, element in enumerate(message.elements or []):
+        if "image" in getattr(element, "mime", ""):
+            await cl.Message(
+                content=f"✅ Received image: **{element.name}**",
+                elements=[
+                    cl.Image(
+                        name=element.name,
+                        path=element.path,
+                        display="inline"
+                    )
+                ]
+            ).send()
 
-    chat_messages.append({"role": "assistant", "content": response})
-    cl.user_session.set("chat_messages", chat_messages)
+    # Prepare the user's query
+    user_query = message.content
+
+    # If no specific question is asked with the image, provide a general analysis
+    if images and not user_query.strip():
+        user_query = PRESCRIPTION_AGENT_PROMPT
+
+    # Handle explicit search command
+    if message.command == "Search" and user_query:
+        user_query = f"Please search the web for: {user_query}"
+
+        # Create a message for streaming the response
+    response_msg = cl.Message(content="")
+    await response_msg.send()
+
+    # Show thinking indicator for reasoning models
+    thinking_msg = None
+    if agent.reasoning:
+        current_model = cl.user_session.get("current_model", "Unknown Model")
+        thinking_msg = cl.Message(content=f"🤔 {current_model} is thinking...")
+        await thinking_msg.send()
+
+    try:
+        # Run the agent with streaming
+        response_iterator = await cl.make_async(agent.run)(
+            user_query,
+            images=images,
+            stream=True
+        )
+
+        # Track if we've started receiving actual content
+        content_started = False
+
+        # Stream the response chunks
+        for chunk in response_iterator:
+            # Extract content from the chunk
+            content = None
+            if chunk and hasattr(chunk, 'content'):
+                content = chunk.content
+            elif chunk and hasattr(chunk, 'get_content_as_string'):
+                content = chunk.get_content_as_string()
+
+            if content:
+                # Remove thinking message once content starts
+                if not content_started and thinking_msg:
+                    await thinking_msg.remove()
+                    thinking_msg = None
+                    content_started = True
+
+                await response_msg.stream_token(content)
+
+        # Finalize the message
+        await response_msg.update()
+
+    except Exception as stream_error:
+        # Fallback to non-streaming if streaming fails
+        print(f"Streaming failed, using non-streaming mode: {stream_error}")
+
+        try:
+            # Remove thinking message if it exists
+            if thinking_msg:
+                await thinking_msg.remove()
+
+            # Run without streaming
+            response = await cl.make_async(agent.run)(
+                user_query,
+                images=images,
+                stream=False
+            )
+
+            # Get the content from the response
+            if hasattr(response, 'content'):
+                content = response.content
+            elif hasattr(response, 'get_content'):
+                content = response.get_content()
+            else:
+                content = str(response)
+
+            # Display the full response at once
+            await response_msg.stream_token(content)
+            await response_msg.update()
+
+        except Exception as e:
+            # Remove thinking message if it exists
+            if thinking_msg:
+                await thinking_msg.remove()
+
+            # Handle any errors gracefully
+            error_msg = f"❌ An error occurred: {str(e)}"
+            await cl.Message(content=error_msg).send()
