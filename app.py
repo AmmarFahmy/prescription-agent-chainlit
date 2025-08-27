@@ -356,6 +356,12 @@ async def on_chat_start():
                 initial=False,
                 description="Enable advanced document analysis with OCR extraction and verification"
             ),
+            Switch(
+                id="Analyze",
+                label="Analyze (Extract and review OCR)",
+                initial=False,
+                description="Extract the full markdown via OCR, review it, then proceed or redo"
+            ),
         ]
     ).send()
 
@@ -367,6 +373,8 @@ async def on_chat_start():
     cl.user_session.set("chat_messages", [])
     cl.user_session.set("current_model", "OpenAI o4-mini (Reasoning)")
     cl.user_session.set("deep_understanding", False)
+    cl.user_session.set("analyze_mode", False)
+    cl.user_session.set("analyze_md", None)
 
     # Set available commands
     await cl.context.emitter.set_commands(COMMANDS)
@@ -374,44 +382,86 @@ async def on_chat_start():
 
 @cl.on_settings_update
 async def setup_agent(settings):
-    """Handle settings update to switch between models or toggle Deep Understanding."""
+    """Handle settings update to switch between models or toggle modes."""
     selected_model = settings["Model"]
     current_model = cl.user_session.get("current_model")
     deep_understanding = settings.get("DeepUnderstanding", False)
+    analyze_mode = settings.get("Analyze", False)
     current_deep_understanding = cl.user_session.get(
         "deep_understanding", False)
+    current_analyze_mode = cl.user_session.get("analyze_mode", False)
+
+    # Enforce mutual exclusivity
+    if deep_understanding and analyze_mode:
+        if analyze_mode != current_analyze_mode:
+            deep_understanding = False
+        elif deep_understanding != current_deep_understanding:
+            analyze_mode = False
+
+    # Persist toggles
+    if deep_understanding != current_deep_understanding:
+        cl.user_session.set("deep_understanding", deep_understanding)
+        await cl.Message(content=f"🔍 Deep Understanding mode {'enabled' if deep_understanding else 'disabled'}").send()
+    if analyze_mode != current_analyze_mode:
+        cl.user_session.set("analyze_mode", analyze_mode)
+        await cl.Message(content=f"🧪 Analyze mode {'enabled' if analyze_mode else 'disabled'}").send()
+        if not analyze_mode:
+            cl.user_session.set("analyze_md", None)
 
     # Check if model changed
     if selected_model != current_model:
-        # Show model switching message
         await cl.Message(content=f"Switching to {selected_model}...").send()
-
-        # Create new agent with selected model
         agent = create_agent(selected_model)
-
-        # Update session
         cl.user_session.set("agent", agent)
         cl.user_session.set("current_model", selected_model)
-
-        # Confirm model switch
         await cl.Message(content=f"✅ Now using **{selected_model}**").send()
 
-    # Check if Deep Understanding setting changed
-    if deep_understanding != current_deep_understanding:
-        cl.user_session.set("deep_understanding", deep_understanding)
-        status = "enabled" if deep_understanding else "disabled"
-        await cl.Message(content=f"🔍 Deep Understanding mode **{status}**").send()
+
+@cl.action_callback("proceed_next")
+async def proceed_next(action: cl.Action):
+    md = cl.user_session.get("analyze_md")
+    if not md:
+        await cl.Message(content="⚠️ No extracted content available. Please upload an image and enable Analyze.").send()
+        return
+    await cl.Message(content="➡️ Proceeding to chat with the extracted content.").send()
+    # Prefill the user's query with extracted md for the next prompt
+    cl.user_session.set("prefill_md", md)
+    # Remove actions
+    await cl.Action.remove("proceed_next")
+    await cl.Action.remove("redo_ocr")
+
+
+@cl.action_callback("redo_ocr")
+async def redo_ocr(action: cl.Action):
+    images = cl.user_session.get("last_images") or []
+    if not images:
+        await cl.Message(content="⚠️ No image found to reprocess. Please upload again.").send()
+        return
+    try:
+        md = await process_image_with_mistral_ocr(images[0].filepath)
+        cl.user_session.set("analyze_md", md)
+        actions = [
+            cl.Action(name="proceed_next", payload={
+                      "value": "proceed"}, label="Proceed to Next", tooltip="Proceed to Next"),
+            cl.Action(name="redo_ocr", payload={
+                      "value": "redo"}, label="Redo", tooltip="Redo the OCR"),
+        ]
+        await cl.Message(content=md, actions=actions).send()
+    except Exception as e:
+        await cl.Message(content=f"❌ OCR extraction failed: {str(e)}").send()
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
     """Handle incoming messages and images from the user."""
 
-    # Get the agent from session
+    # Get session state
     agent = cl.user_session.get("agent")
+    analyze_mode = cl.user_session.get("analyze_mode", False)
 
     # Extract images from uploaded files
     images = _extract_agno_images_from_message(message)
+    cl.user_session.set("last_images", images)
 
     # Show uploaded images in chat
     for i, element in enumerate(message.elements or []):
@@ -427,8 +477,33 @@ async def on_message(message: cl.Message):
                 ]
             ).send()
 
-        # Prepare the user's query
-    user_query = message.content
+    # Analyze mode: run OCR, show markdown with actions, then stop until user clicks
+    if analyze_mode and images:
+        try:
+            # Only process first image for now (extendable)
+            md = await process_image_with_mistral_ocr(images[0].filepath)
+            cl.user_session.set("analyze_md", md)
+
+            # Show markdown with actions
+            actions = [
+                cl.Action(name="proceed_next", payload={
+                          "value": "proceed"}, label="Proceed to Next", tooltip="Proceed to Next"),
+                cl.Action(name="redo_ocr", payload={
+                          "value": "redo"}, label="Redo", tooltip="Redo the OCR"),
+            ]
+            await cl.Message(content=md, actions=actions).send()
+            return
+        except Exception as e:
+            await cl.Message(content=f"❌ OCR extraction failed: {str(e)}").send()
+            return
+
+    # Prepare the user's query
+    prefill_md = cl.user_session.get("prefill_md")
+    if prefill_md:
+        user_query = f"Using the extracted OCR content below, address the user's questions and provide insights.\n\nExtracted Content (Markdown):\n{prefill_md}\n\nUser message: {message.content}"
+        cl.user_session.set("prefill_md", None)
+    else:
+        user_query = message.content
 
     # If no specific question is asked with the image, provide a general analysis
     if images and not user_query.strip():
@@ -441,7 +516,6 @@ async def on_message(message: cl.Message):
     # Check if Deep Understanding is enabled and we have images
     deep_understanding = cl.user_session.get("deep_understanding", False)
     if deep_understanding and images:
-        # Run the enhanced workflow
         user_query = await deep_understanding_workflow(agent, user_query, images)
 
     # Create a message for streaming the response
@@ -468,7 +542,6 @@ async def on_message(message: cl.Message):
 
         # Stream the response chunks
         for chunk in response_iterator:
-            # Extract content from the chunk
             content = None
             if chunk and hasattr(chunk, 'content'):
                 content = chunk.content
@@ -476,7 +549,6 @@ async def on_message(message: cl.Message):
                 content = chunk.get_content_as_string()
 
             if content:
-                # Remove thinking message once content starts
                 if not content_started and thinking_msg:
                     await thinking_msg.remove()
                     thinking_msg = None
@@ -484,26 +556,21 @@ async def on_message(message: cl.Message):
 
                 await response_msg.stream_token(content)
 
-        # Finalize the message
         await response_msg.update()
 
     except Exception as stream_error:
-        # Fallback to non-streaming if streaming fails
         print(f"Streaming failed, using non-streaming mode: {stream_error}")
 
         try:
-            # Remove thinking message if it exists
             if thinking_msg:
                 await thinking_msg.remove()
 
-            # Run without streaming
             response = await cl.make_async(agent.run)(
                 user_query,
                 images=images,
                 stream=False
             )
 
-            # Get the content from the response
             if hasattr(response, 'content'):
                 content = response.content
             elif hasattr(response, 'get_content'):
@@ -511,15 +578,11 @@ async def on_message(message: cl.Message):
             else:
                 content = str(response)
 
-            # Display the full response at once
             await response_msg.stream_token(content)
             await response_msg.update()
 
         except Exception as e:
-            # Remove thinking message if it exists
             if thinking_msg:
                 await thinking_msg.remove()
 
-            # Handle any errors gracefully
-            error_msg = f"❌ An error occurred: {str(e)}"
-            await cl.Message(content=error_msg).send()
+            await cl.Message(content=f"❌ An error occurred: {str(e)}").send()
