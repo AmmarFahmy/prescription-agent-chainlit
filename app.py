@@ -12,8 +12,6 @@ from mistralai import Mistral
 from mistralai.models import OCRResponse
 from mistralai import DocumentURLChunk
 from pathlib import Path
-import base64
-import tempfile
 
 
 DEFAULT_OPENAI_MODEL = "o4-mini"
