@@ -16,6 +16,7 @@ from pathlib import Path
 
 DEFAULT_OPENAI_MODEL = "o4-mini"
 DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_MISTRAL_MODEL = "mistral-ocr-latest"
 
 linkup_client = LinkupClient(api_key=os.environ["LINKUP_API_KEY"])
 
@@ -187,7 +188,7 @@ async def process_image_with_mistral_ocr(image_path: str) -> str:
         # Process with OCR
         ocr_response = await cl.make_async(mistral_client.ocr.process)(
             document=DocumentURLChunk(document_url=signed_url.url),
-            model="mistral-ocr-latest",
+            model=DEFAULT_MISTRAL_MODEL,
             include_image_base64=False
         )
 
