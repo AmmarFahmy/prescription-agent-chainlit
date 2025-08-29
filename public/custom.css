@@ -1,0 +1,30 @@
+:root {
+  /* Pink brand color close to Chainlit's default accent */
+  --cl-accent: #db2777; /* pink-600 */
+  --cl-accent-foreground: #ffffff;
+}
+
+/* Action buttons (primary look) */
+button[data-testid="action-button"],
+button.cl-action-btn {
+  background-color: var(--cl-accent) !important;
+  color: var(--cl-accent-foreground) !important;
+  border-color: transparent !important;
+}
+button[data-testid="action-button"]:hover,
+button.cl-action-btn:hover {
+  filter: brightness(0.95);
+}
+
+/* Secondary variant (if rendered) */
+button[data-variant="secondary"].cl-action-btn {
+  background-color: #fce7f3 !important; /* pink-100 */
+  color: #9d174d !important; /* rose-700 */
+}
+
+/* Ensure focus ring matches accent */
+button[data-testid="action-button"]:focus-visible,
+button.cl-action-btn:focus-visible {
+  outline: 2px solid var(--cl-accent) !important;
+  outline-offset: 2px;
+} 
